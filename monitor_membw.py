@@ -266,6 +266,31 @@ class MemoryBandwidthMonitor:
             # Don't crash if CSV logging fails, just skip it
             pass
     
+    def _prepare_csv_data(self, iteration: int, rates: Dict, node_rates: Dict, zone_lock_metrics: Optional[Dict]) -> dict:
+        """Prepare CSV data dictionary from monitoring metrics"""
+        csv_data = {
+            'timestamp': datetime.now().isoformat(),
+            'iteration': iteration,
+            'total_mb_s': rates.get('total_mb_s', 0),
+            'read_mb_s': rates.get('read_mb_s', 0),
+            'write_mb_s': rates.get('write_mb_s', 0),
+            'minor_faults_s': rates.get('minor_faults_s', 0),
+            'major_faults_s': rates.get('major_faults_s', 0),
+            'numa_local_pct': rates.get('numa_local_pct', 0),
+            'memory_pressure': rates.get('memory_pressure', 0),
+            'allocstall_s': rates.get('allocstall_s', 0),
+        }
+        # Add per-node bandwidth
+        for node_id in self.numa_nodes:
+            nr = node_rates.get(node_id, {})
+            csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
+            csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
+        # Add zone lock metrics if available
+        if zone_lock_metrics:
+            csv_data['lock_contention_pressure'] = zone_lock_metrics.get('lock_contention_pressure', 0)
+            csv_data['zone_lock_acq_per_sec'] = zone_lock_metrics.get('zone_lock_acq_per_sec', 0)
+        return csv_data
+    
     def read_vmstat(self) -> VmStats:
         """Read /proc/vmstat and parse relevant counters"""
         stats = VmStats()
@@ -1104,27 +1129,7 @@ class MemoryBandwidthMonitor:
                 
                 # Log to CSV if enabled
                 if self.csv_file and rates:
-                    csv_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'iteration': iteration,
-                        'total_mb_s': rates.get('total_mb_s', 0),
-                        'read_mb_s': rates.get('read_mb_s', 0),
-                        'write_mb_s': rates.get('write_mb_s', 0),
-                        'minor_faults_s': rates.get('minor_faults_s', 0),
-                        'major_faults_s': rates.get('major_faults_s', 0),
-                        'numa_local_pct': rates.get('numa_local_pct', 0),
-                        'memory_pressure': rates.get('memory_pressure', 0),
-                        'allocstall_s': rates.get('allocstall_s', 0),
-                    }
-                    # Add per-node bandwidth
-                    for node_id in self.numa_nodes:
-                        nr = node_rates.get(node_id, {})
-                        csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
-                        csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
-                    # Add zone lock metrics if available
-                    if zone_lock_metrics:
-                        csv_data['lock_contention_pressure'] = zone_lock_metrics.get('lock_contention_pressure', 0)
-                        csv_data['zone_lock_acq_per_sec'] = zone_lock_metrics.get('zone_lock_acq_per_sec', 0)
+                    csv_data = self._prepare_csv_data(iteration, rates, node_rates, zone_lock_metrics)
                     self._log_to_csv(csv_data)
                 
                 # Update previous stats - key by name for merge mode, by pid otherwise
@@ -1598,27 +1603,7 @@ class MemoryBandwidthMonitor:
                 
                 # Log to CSV if enabled
                 if self.csv_file and rates:
-                    csv_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'iteration': iteration,
-                        'total_mb_s': rates.get('total_mb_s', 0),
-                        'read_mb_s': rates.get('read_mb_s', 0),
-                        'write_mb_s': rates.get('write_mb_s', 0),
-                        'minor_faults_s': rates.get('minor_faults_s', 0),
-                        'major_faults_s': rates.get('major_faults_s', 0),
-                        'numa_local_pct': rates.get('numa_local_pct', 0),
-                        'memory_pressure': rates.get('memory_pressure', 0),
-                        'allocstall_s': rates.get('allocstall_s', 0),
-                    }
-                    # Add per-node bandwidth
-                    for node_id in self.numa_nodes:
-                        nr = node_rates.get(node_id, {})
-                        csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
-                        csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
-                    # Add zone lock metrics if available
-                    if zone_lock_metrics:
-                        csv_data['lock_contention_pressure'] = zone_lock_metrics.get('lock_contention_pressure', 0)
-                        csv_data['zone_lock_acq_per_sec'] = zone_lock_metrics.get('zone_lock_acq_per_sec', 0)
+                    csv_data = self._prepare_csv_data(iteration, rates, node_rates, zone_lock_metrics)
                     self._log_to_csv(csv_data)
                 
                 prev_vmstats = current_vmstats
