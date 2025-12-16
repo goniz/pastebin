@@ -36,7 +36,10 @@ from typing import Dict, List, Optional, Tuple
 import re
 
 # Constants
-PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')  # Dynamically get system page size
+try:
+    PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')  # Dynamically get system page size
+except (OSError, ValueError):
+    PAGE_SIZE = 4096  # Fallback to common default if not available
 CACHE_LINE_SIZE = 64  # bytes for AMD EPYC
 
 @dataclass
