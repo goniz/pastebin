@@ -1087,22 +1087,7 @@ class MemoryBandwidthMonitor:
                 
                 # Log to CSV if enabled
                 if self.csv_file and rates:
-                    csv_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'iteration': iteration,
-                        'total_mb_s': rates.get('total_mb_s', 0),
-                        'read_mb_s': rates.get('read_mb_s', 0),
-                        'write_mb_s': rates.get('write_mb_s', 0),
-                        'minor_faults_s': rates.get('minor_faults_s', 0),
-                        'major_faults_s': rates.get('major_faults_s', 0),
-                        'numa_local_pct': rates.get('numa_local_pct', 0),
-                        'memory_pressure': rates.get('memory_pressure', 0),
-                    }
-                    # Add per-node bandwidth
-                    for node_id, nr in node_rates.items():
-                        csv_data[f'node{node_id}_total_mb_s'] = nr.get('total_mb_s', 0)
-                        csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
-                        csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
+                    csv_data = self._create_csv_data(rates, node_rates, iteration)
                     self._log_to_csv(csv_data)
                 
                 # Update previous stats - key by name for merge mode, by pid otherwise
@@ -1576,22 +1561,7 @@ class MemoryBandwidthMonitor:
                 
                 # Log to CSV if enabled
                 if self.csv_file and rates:
-                    csv_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'iteration': iteration,
-                        'total_mb_s': rates.get('total_mb_s', 0),
-                        'read_mb_s': rates.get('read_mb_s', 0),
-                        'write_mb_s': rates.get('write_mb_s', 0),
-                        'minor_faults_s': rates.get('minor_faults_s', 0),
-                        'major_faults_s': rates.get('major_faults_s', 0),
-                        'numa_local_pct': rates.get('numa_local_pct', 0),
-                        'memory_pressure': rates.get('memory_pressure', 0),
-                    }
-                    # Add per-node bandwidth
-                    for node_id, nr in node_rates.items():
-                        csv_data[f'node{node_id}_total_mb_s'] = nr.get('total_mb_s', 0)
-                        csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
-                        csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
+                    csv_data = self._create_csv_data(rates, node_rates, iteration)
                     self._log_to_csv(csv_data)
                 
                 prev_vmstats = current_vmstats
@@ -1631,9 +1601,29 @@ class MemoryBandwidthMonitor:
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(data)
-        except IOError as e:
+        except IOError:
             # Silently ignore CSV write errors to not disrupt monitoring
             pass
+    
+    def _create_csv_data(self, rates: Dict, node_rates: Dict, iteration: int) -> dict:
+        """Create CSV data structure from current metrics"""
+        csv_data = {
+            'timestamp': datetime.now().isoformat(),
+            'iteration': iteration,
+            'total_mb_s': rates.get('total_mb_s', 0),
+            'read_mb_s': rates.get('read_mb_s', 0),
+            'write_mb_s': rates.get('write_mb_s', 0),
+            'minor_faults_s': rates.get('minor_faults_s', 0),
+            'major_faults_s': rates.get('major_faults_s', 0),
+            'numa_local_pct': rates.get('numa_local_pct', 0),
+            'memory_pressure': rates.get('memory_pressure', 0),
+        }
+        # Add per-node bandwidth
+        for node_id, nr in node_rates.items():
+            csv_data[f'node{node_id}_total_mb_s'] = nr.get('total_mb_s', 0)
+            csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
+            csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
+        return csv_data
 
 
 def signal_handler(signum, frame):
