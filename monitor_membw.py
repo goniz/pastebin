@@ -167,6 +167,12 @@ class ProcessMemStats:
     numa_stack_pages: Dict[int, int] = field(
         default_factory=dict
     )  # Stack pages per node
+    # Scheduler metrics from /proc/[pid]/sched
+    numa_pages_migrated: int = 0  # Pages migrated between NUMA nodes
+    numa_preferred_nid: int = -1  # Preferred NUMA node (-1 = not set)
+    total_numa_faults: int = 0  # Total NUMA faults
+    nr_involuntary_switches: int = 0  # Involuntary context switches (preemptions)
+    se_nr_migrations: int = 0  # CPU migrations
     count: int = 1  # Number of merged processes (for --merge mode)
 
 
@@ -217,7 +223,10 @@ class MemoryBandwidthMonitor:
     """Main monitoring class for memory bandwidth and cache statistics"""
 
     def __init__(
-        self, interval: float = 1.0, top_n: int = 10, merge_by_name: bool = False
+        self,
+        interval: float = 1.0,
+        top_n: int = 10,
+        merge_by_name: bool = False,
     ):
         self.interval = interval
         self.top_n = top_n
@@ -246,6 +255,12 @@ class MemoryBandwidthMonitor:
         self.prev_zone_stats: Dict[str, ZoneInfo] = {}
         self.trends["zone_lock_pressure"] = TrendData()
         self.trends["pcp_refill_rate"] = TrendData()
+
+        # Scheduler statistics trends
+        self.trends["cpu_migrations"] = TrendData()
+        self.trends["numa_faults"] = TrendData()
+        self.trends["involuntary_switches"] = TrendData()
+        self.trends["numa_page_migrations"] = TrendData()
 
     def _detect_numa_nodes(self) -> List[int]:
         """Detect available NUMA nodes"""
@@ -670,7 +685,55 @@ class MemoryBandwidthMonitor:
         except (IOError, PermissionError, FileNotFoundError):
             pass
 
+        # Always read scheduler stats for all processes
+        self._read_process_sched_stats(stats)
+
         return stats
+
+    def _read_process_sched_stats(self, stats: ProcessMemStats):
+        """Read scheduler stats from /proc/[pid]/sched
+
+        Parses key scheduler metrics that indicate NUMA and CPU affinity issues:
+        - numa_pages_migrated: Pages moved between NUMA nodes
+        - numa_preferred_nid: Kernel's preferred NUMA node for this process
+        - total_numa_faults: NUMA faults triggering balancing decisions
+        - nr_involuntary_switches: Preemptions (indicates CPU contention)
+        - se.nr_migrations: CPU migrations (indicates poor affinity)
+        """
+        sched_path = f"/proc/{stats.pid}/sched"
+
+        try:
+            with open(sched_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if ":" not in line:
+                        continue
+
+                    parts = line.split(":")
+                    if len(parts) != 2:
+                        continue
+
+                    key = parts[0].strip()
+                    value_str = parts[1].strip()
+
+                    try:
+                        value = int(value_str)
+                    except ValueError:
+                        # Some values are floats (like se.exec_start), skip them
+                        continue
+
+                    if key == "numa_pages_migrated":
+                        stats.numa_pages_migrated = value
+                    elif key == "numa_preferred_nid":
+                        stats.numa_preferred_nid = value
+                    elif key == "total_numa_faults":
+                        stats.total_numa_faults = value
+                    elif key == "nr_involuntary_switches":
+                        stats.nr_involuntary_switches = value
+                    elif key == "se.nr_migrations":
+                        stats.se_nr_migrations = value
+        except (IOError, PermissionError, FileNotFoundError):
+            pass
 
     def _enrich_process_numa_stats(self, stats: ProcessMemStats):
         """Read expensive NUMA maps only for top processes"""
@@ -903,6 +966,14 @@ class MemoryBandwidthMonitor:
                     existing.numa_stack_pages[node_id] = (
                         existing.numa_stack_pages.get(node_id, 0) + pages
                     )
+                # Merge scheduler stats
+                existing.numa_pages_migrated += proc.numa_pages_migrated
+                existing.total_numa_faults += proc.total_numa_faults
+                existing.nr_involuntary_switches += proc.nr_involuntary_switches
+                existing.se_nr_migrations += proc.se_nr_migrations
+                # For numa_preferred_nid: keep first non-negative value
+                if existing.numa_preferred_nid == -1 and proc.numa_preferred_nid >= 0:
+                    existing.numa_preferred_nid = proc.numa_preferred_nid
                 existing.count += 1
             else:
                 # Create a new merged entry (use negative pid to indicate merged)
@@ -937,6 +1008,11 @@ class MemoryBandwidthMonitor:
                     numa_file_pages=proc.numa_file_pages.copy(),
                     numa_heap_pages=proc.numa_heap_pages.copy(),
                     numa_stack_pages=proc.numa_stack_pages.copy(),
+                    numa_pages_migrated=proc.numa_pages_migrated,
+                    numa_preferred_nid=proc.numa_preferred_nid,
+                    total_numa_faults=proc.total_numa_faults,
+                    nr_involuntary_switches=proc.nr_involuntary_switches,
+                    se_nr_migrations=proc.se_nr_migrations,
                     count=1,
                 )
 
@@ -1023,6 +1099,22 @@ class MemoryBandwidthMonitor:
                     max(0, (proc.stime - prev.stime) / hz) / elapsed * 100
                 )
                 rates["cpu_total_pct"] = rates["cpu_user_pct"] + rates["cpu_sys_pct"]
+
+                # Scheduler metric rates
+                rates["migrations_s"] = (
+                    max(0, proc.se_nr_migrations - prev.se_nr_migrations) / elapsed
+                )
+                rates["involuntary_switches_s"] = (
+                    max(0, proc.nr_involuntary_switches - prev.nr_involuntary_switches)
+                    / elapsed
+                )
+                rates["numa_faults_s"] = (
+                    max(0, proc.total_numa_faults - prev.total_numa_faults) / elapsed
+                )
+                rates["numa_page_migrations_s"] = (
+                    max(0, proc.numa_pages_migrated - prev.numa_pages_migrated)
+                    / elapsed
+                )
             else:
                 rates["minor_faults_s"] = 0
                 rates["major_faults_s"] = 0
@@ -1044,6 +1136,10 @@ class MemoryBandwidthMonitor:
                 rates["cpu_user_pct"] = 0
                 rates["cpu_sys_pct"] = 0
                 rates["cpu_total_pct"] = 0
+                rates["migrations_s"] = 0
+                rates["involuntary_switches_s"] = 0
+                rates["numa_faults_s"] = 0
+                rates["numa_page_migrations_s"] = 0
 
             # Calculate NUMA locality from numa_maps data
             # NOTE: detailed numa_maps data is now loaded lazily only for top processes
@@ -1078,7 +1174,14 @@ class MemoryBandwidthMonitor:
                 rates["numa_dist_str"] = "N/A"
                 rates["numa_mb"] = {}
 
-            # Memory activity score (for sorting) - enhanced with new metrics
+            # Absolute scheduler values for display
+            rates["numa_preferred_nid"] = proc.numa_preferred_nid
+            rates["total_migrations"] = proc.se_nr_migrations
+            rates["total_involuntary_switches"] = proc.nr_involuntary_switches
+            rates["total_numa_faults"] = proc.total_numa_faults
+            rates["total_numa_page_migrations"] = proc.numa_pages_migrated
+
+            # Memory activity score (for sorting) - enhanced with scheduler metrics
             rates["activity_score"] = (
                 rates["minor_faults_s"] * 0.1
                 + rates["major_faults_s"] * 10
@@ -1087,6 +1190,9 @@ class MemoryBandwidthMonitor:
                 + (rates["io_read_mb_s"] + rates["io_write_mb_s"]) * 100
                 + abs(rates["rss_change_kb_s"]) * 0.01
                 + proc.rss / 1024  # MB of RSS
+                + rates["migrations_s"] * 0.5  # CPU migrations are significant
+                + rates["numa_faults_s"] * 1.0  # NUMA faults indicate locality issues
+                + rates["numa_page_migrations_s"] * 2.0  # Page migrations are expensive
             )
 
             process_rates.append((proc, rates))
@@ -1097,7 +1203,7 @@ class MemoryBandwidthMonitor:
         # Get top N processes
         top_processes = process_rates[: self.top_n]
 
-        # Enrich top processes with expensive NUMA stats
+        # Enrich top processes with expensive NUMA stats and sched stats
         for proc, rates in top_processes:
             # If we merged processes, we can't easily get NUMA maps for the aggregate
             # But if it's a single process (not merged), or if merge mode is off:
@@ -1260,6 +1366,16 @@ class MemoryBandwidthMonitor:
                     for node_id in self.numa_nodes
                 }
 
+                # Count processes with preferred NUMA node
+                node_proc_counts = self._count_procs_with_preferred_node(
+                    current_processes
+                )
+
+                # Calculate scheduler aggregates from all processes
+                sched_aggregates = self._calculate_sched_aggregates(
+                    current_processes, prev_proc_stats, elapsed
+                )
+
                 # Display
                 self._draw_screen(
                     stdscr,
@@ -1271,6 +1387,8 @@ class MemoryBandwidthMonitor:
                     iteration,
                     zone_lock_metrics,
                     pcp_stats,
+                    sched_aggregates,
+                    node_proc_counts,
                 )
 
                 # Update previous stats - key by name for merge mode, by pid otherwise
@@ -1289,6 +1407,60 @@ class MemoryBandwidthMonitor:
             except KeyboardInterrupt:
                 break
 
+    def _calculate_sched_aggregates(
+        self, processes: List[ProcessMemStats], prev_stats: Dict, elapsed: float
+    ) -> Dict:
+        """Calculate aggregate scheduler statistics from all processes
+
+        Provides system-wide scheduler metrics aggregated from all running processes.
+        """
+        totals = {
+            "migrations_s": 0.0,
+            "involuntary_switches_s": 0.0,
+            "numa_faults_s": 0.0,
+            "numa_page_migrations_s": 0.0,
+        }
+
+        for proc in processes:
+            key = proc.name if self.merge_by_name else proc.pid
+            prev = prev_stats.get(key)
+
+            if prev and elapsed > 0:
+                totals["migrations_s"] += (
+                    max(0, proc.se_nr_migrations - prev.se_nr_migrations) / elapsed
+                )
+                totals["involuntary_switches_s"] += (
+                    max(0, proc.nr_involuntary_switches - prev.nr_involuntary_switches)
+                    / elapsed
+                )
+                totals["numa_faults_s"] += (
+                    max(0, proc.total_numa_faults - prev.total_numa_faults) / elapsed
+                )
+                totals["numa_page_migrations_s"] += (
+                    max(0, proc.numa_pages_migrated - prev.numa_pages_migrated)
+                    / elapsed
+                )
+
+        return totals
+
+    def _count_procs_with_preferred_node(
+        self, processes: List[ProcessMemStats]
+    ) -> Dict[int, int]:
+        """Count number of processes per NUMA node with numa_preferred_nid set to that node
+
+        Returns a dict mapping node_id -> count of processes with that preferred node.
+        """
+        node_proc_counts = {node_id: 0 for node_id in self.numa_nodes}
+
+        for proc in processes:
+            if (
+                proc.numa_preferred_nid >= 0
+                and proc.numa_preferred_nid in node_proc_counts
+            ):
+                node_proc_counts[proc.numa_preferred_nid] += 1
+
+        return node_proc_counts
+
     def _draw_screen(
         self,
         stdscr,
@@ -1300,6 +1472,8 @@ class MemoryBandwidthMonitor:
         iteration: int,
         zone_lock_metrics: Optional[Dict] = None,
         pcp_stats: Optional[Dict] = None,
+        sched_aggregates: Optional[Dict] = None,
+        node_proc_counts: Optional[Dict[int, int]] = None,
     ):
         """Draw the monitoring screen"""
         stdscr.clear()
@@ -1416,6 +1590,16 @@ class MemoryBandwidthMonitor:
             )
             row += 1
 
+            # Display number of processes with this node as preferred
+            if node_proc_counts:
+                proc_count = node_proc_counts.get(node_id, 0)
+                stdscr.addstr(
+                    row,
+                    0,
+                    f"          Procs with preferred_nid={node_id}: {proc_count}",
+                )
+                row += 1
+
         row += 1
 
         # NUMA Locality
@@ -1481,6 +1665,80 @@ class MemoryBandwidthMonitor:
             row += 1
             stdscr.addstr(row, 0, "  Memory Pressure: ")
             stdscr.addstr(f"{pressure:.1f}/100", pressure_color)
+            row += 2
+
+        # Scheduler Statistics Section (always visible)
+        if sched_aggregates and row < height - 15:
+            mig_trend = self.trends["cpu_migrations"].trend()
+            inv_trend = self.trends["involuntary_switches"].trend()
+            numa_flt_trend = self.trends["numa_faults"].trend()
+            numa_mig_trend = self.trends["numa_page_migrations"].trend()
+
+            total_migrations_s = sched_aggregates.get("migrations_s", 0)
+            total_inv_switches_s = sched_aggregates.get("involuntary_switches_s", 0)
+            total_numa_faults_s = sched_aggregates.get("numa_faults_s", 0)
+            total_numa_mig_s = sched_aggregates.get("numa_page_migrations_s", 0)
+
+            # Update trends
+            self.trends["cpu_migrations"].add(total_migrations_s)
+            self.trends["involuntary_switches"].add(total_inv_switches_s)
+            self.trends["numa_faults"].add(total_numa_faults_s)
+            self.trends["numa_page_migrations"].add(total_numa_mig_s)
+
+            # Section title
+            section_title = "SCHEDULER STATISTICS (all processes)"
+
+            stdscr.addstr(row, 0, section_title, curses.A_BOLD | curses.color_pair(5))
+            row += 1
+
+            # Color based on thresholds
+            mig_color = (
+                curses.color_pair(3)
+                if total_migrations_s > 500
+                else (
+                    curses.color_pair(2)
+                    if total_migrations_s > 100
+                    else curses.color_pair(1)
+                )
+            )
+            inv_color = (
+                curses.color_pair(3)
+                if total_inv_switches_s > 5000
+                else (
+                    curses.color_pair(2)
+                    if total_inv_switches_s > 1000
+                    else curses.color_pair(1)
+                )
+            )
+            numa_mig_color = (
+                curses.color_pair(3)
+                if total_numa_mig_s > 100
+                else (
+                    curses.color_pair(2)
+                    if total_numa_mig_s > 10
+                    else curses.color_pair(1)
+                )
+            )
+
+            stdscr.addstr(row, 0, f"  CPU Migrations: ")
+            stdscr.addstr(
+                f"{self.format_rate(total_migrations_s)} {mig_trend}", mig_color
+            )
+            stdscr.addstr(f" | Involuntary Switches: ")
+            stdscr.addstr(
+                f"{self.format_rate(total_inv_switches_s)} {inv_trend}", inv_color
+            )
+            row += 1
+
+            stdscr.addstr(
+                row,
+                0,
+                f"  NUMA Faults: {self.format_rate(total_numa_faults_s)} {numa_flt_trend} | ",
+            )
+            stdscr.addstr(f"NUMA Pages Migrated: ")
+            stdscr.addstr(
+                f"{self.format_rate(total_numa_mig_s)} {numa_mig_trend}", numa_mig_color
+            )
             row += 2
 
         # Zone Lock Contention Metrics (critical for diagnosing allocator contention)
@@ -1572,12 +1830,23 @@ class MemoryBandwidthMonitor:
             )
         row += 1
 
-        # Header - include Count column for merged mode
-        # Enhanced header with syscalls, allocation rate, and NUMA distribution
+        # Determine display mode based on terminal width
+        # Option 1 (narrow <95): replace Sys/s with Mig/s
+        # Option 3 (wide >=95): show all columns including Sys/s, Mig/s, InvSw
+        NARROW_WIDTH = 95
+        wide_mode = width >= NARROW_WIDTH
+
+        # Header - adaptive based on terminal width
         if self.merge_by_name:
-            header_fmt = f"  {'#':>4} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>7} {'CPU%':>5} {'NUMA Distribution':<20}"
+            if wide_mode:
+                header_fmt = f"  {'#':>4} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>6} {'Mig/s':>6} {'InvSw':>6} {'CPU%':>5} {'NUMA Dist':<15}"
+            else:
+                header_fmt = f"  {'#':>4} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Mig/s':>6} {'CPU%':>5} {'NUMA Distribution':<20}"
         else:
-            header_fmt = f"  {'PID':>7} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>7} {'CPU%':>5} {'NUMA Distribution':<20}"
+            if wide_mode:
+                header_fmt = f"  {'PID':>7} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>6} {'Mig/s':>6} {'InvSw':>6} {'CPU%':>5} {'NUMA Dist':<15}"
+            else:
+                header_fmt = f"  {'PID':>7} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Mig/s':>6} {'CPU%':>5} {'NUMA Distribution':<20}"
         stdscr.addstr(row, 0, header_fmt[: width - 1], curses.A_UNDERLINE)
         row += 1
 
@@ -1593,10 +1862,18 @@ class MemoryBandwidthMonitor:
                 color = curses.color_pair(3)  # Red - poor NUMA locality
             elif proc_rates.get("alloc_mb_s", 0) > 100:
                 color = curses.color_pair(3)  # Red - very high allocation rate
+            elif proc_rates.get("migrations_s", 0) > 500:
+                color = curses.color_pair(3)  # Red - very high CPU migrations
             elif numa_local_pct > 0 and numa_local_pct < 90:
                 color = curses.color_pair(2)  # Yellow - moderate NUMA locality
             elif proc_rates.get("alloc_mb_s", 0) > 10:
                 color = curses.color_pair(2)  # Yellow - high allocation rate
+            elif proc_rates.get("migrations_s", 0) > 100:
+                color = curses.color_pair(2)  # Yellow - high CPU migrations
+            elif proc_rates.get("involuntary_switches_s", 0) > 5000:
+                color = curses.color_pair(3)  # Red - very high preemptions
+            elif proc_rates.get("involuntary_switches_s", 0) > 1000:
+                color = curses.color_pair(2)  # Yellow - high preemptions
             elif proc_rates.get("activity_score", 0) > 1000:
                 color = curses.color_pair(2)
             else:
@@ -1620,30 +1897,71 @@ class MemoryBandwidthMonitor:
             else:
                 syscall_str = f"{syscall_rate:.0f}"
 
+            # Format migrations rate
+            migrations_rate = proc_rates.get("migrations_s", 0)
+            if migrations_rate >= 1000:
+                mig_str = f"{migrations_rate / 1000:.1f}K"
+            else:
+                mig_str = f"{migrations_rate:.0f}"
+
+            # Format involuntary switches rate (only for wide mode)
+            inv_rate = proc_rates.get("involuntary_switches_s", 0)
+            if inv_rate >= 1000000:
+                inv_str = f"{inv_rate / 1000000:.1f}M"
+            elif inv_rate >= 1000:
+                inv_str = f"{inv_rate / 1000:.1f}K"
+            else:
+                inv_str = f"{inv_rate:.0f}"
+
             # NUMA distribution string
             numa_str = proc_rates.get("numa_dist_str", "N/A")
 
             if self.merge_by_name:
-                # Show count instead of PID for merged processes
-                proc_line = (
-                    f"  {proc.count:>4} {proc.name[:12]:<12} "
-                    f"{self.format_size(proc.rss):>7} "
-                    f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
-                    f"{alloc_str:>7} "
-                    f"{syscall_str:>7} "
-                    f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
-                    f"{numa_str:<20}"
-                )
+                if wide_mode:
+                    proc_line = (
+                        f"  {proc.count:>4} {proc.name[:12]:<12} "
+                        f"{self.format_size(proc.rss):>7} "
+                        f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
+                        f"{alloc_str:>7} "
+                        f"{syscall_str:>6} "
+                        f"{mig_str:>6} "
+                        f"{inv_str:>6} "
+                        f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
+                        f"{numa_str[:15]:<15}"
+                    )
+                else:
+                    proc_line = (
+                        f"  {proc.count:>4} {proc.name[:12]:<12} "
+                        f"{self.format_size(proc.rss):>7} "
+                        f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
+                        f"{alloc_str:>7} "
+                        f"{mig_str:>6} "
+                        f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
+                        f"{numa_str:<20}"
+                    )
             else:
-                proc_line = (
-                    f"  {proc.pid:>7} {proc.name[:12]:<12} "
-                    f"{self.format_size(proc.rss):>7} "
-                    f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
-                    f"{alloc_str:>7} "
-                    f"{syscall_str:>7} "
-                    f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
-                    f"{numa_str:<20}"
-                )
+                if wide_mode:
+                    proc_line = (
+                        f"  {proc.pid:>7} {proc.name[:12]:<12} "
+                        f"{self.format_size(proc.rss):>7} "
+                        f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
+                        f"{alloc_str:>7} "
+                        f"{syscall_str:>6} "
+                        f"{mig_str:>6} "
+                        f"{inv_str:>6} "
+                        f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
+                        f"{numa_str[:15]:<15}"
+                    )
+                else:
+                    proc_line = (
+                        f"  {proc.pid:>7} {proc.name[:12]:<12} "
+                        f"{self.format_size(proc.rss):>7} "
+                        f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
+                        f"{alloc_str:>7} "
+                        f"{mig_str:>6} "
+                        f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
+                        f"{numa_str:<20}"
+                    )
 
             stdscr.addstr(row, 0, proc_line[: width - 1], color)
             row += 1
@@ -1739,13 +2057,21 @@ class MemoryBandwidthMonitor:
 
                 # NUMA nodes
                 print("NUMA NODES:")
+
+                # Count processes with preferred NUMA node
+                node_proc_counts = self._count_procs_with_preferred_node(
+                    current_processes
+                )
+
                 for node_id in self.numa_nodes:
                     nr = node_rates.get(node_id, {})
                     nm = self.read_numa_node_meminfo(node_id)
+                    proc_count = node_proc_counts.get(node_id, 0)
                     print(
                         f"  Node {node_id}: Local {nr.get('local_mb_s', 0):.1f} MB/s | "
                         f"Remote {nr.get('remote_mb_s', 0):.1f} MB/s | "
-                        f"Mem {self.format_size(nm.mem_total - nm.mem_free)} used"
+                        f"Mem {self.format_size(nm.mem_total - nm.mem_free)} used | "
+                        f"Procs with preferred_nid={node_id}: {proc_count}"
                     )
                 print()
 
@@ -1762,6 +2088,59 @@ class MemoryBandwidthMonitor:
                         f"Major {self.format_rate(rates.get('major_faults_s', 0))} | "
                         f"Pressure {rates.get('memory_pressure', 0):.1f}/100\n"
                     )
+
+                # Calculate scheduler aggregates from all processes
+                sched_aggregates = self._calculate_sched_aggregates(
+                    current_processes, prev_proc_stats, elapsed
+                )
+
+                # Scheduler Statistics
+                if sched_aggregates:
+                    print("SCHEDULER STATISTICS (all processes):")
+
+                    total_migrations_s = sched_aggregates.get("migrations_s", 0)
+                    total_inv_switches_s = sched_aggregates.get(
+                        "involuntary_switches_s", 0
+                    )
+                    total_numa_faults_s = sched_aggregates.get("numa_faults_s", 0)
+                    total_numa_mig_s = sched_aggregates.get("numa_page_migrations_s", 0)
+
+                    # Update trends
+                    self.trends["cpu_migrations"].add(total_migrations_s)
+                    self.trends["involuntary_switches"].add(total_inv_switches_s)
+                    self.trends["numa_faults"].add(total_numa_faults_s)
+                    self.trends["numa_page_migrations"].add(total_numa_mig_s)
+
+                    mig_trend = self.trends["cpu_migrations"].trend()
+                    inv_trend = self.trends["involuntary_switches"].trend()
+                    numa_flt_trend = self.trends["numa_faults"].trend()
+                    numa_mig_trend = self.trends["numa_page_migrations"].trend()
+
+                    mig_warning = (
+                        " [HIGH]"
+                        if total_migrations_s > 500
+                        else (" [MODERATE]" if total_migrations_s > 100 else "")
+                    )
+                    inv_warning = (
+                        " [HIGH]"
+                        if total_inv_switches_s > 5000
+                        else (" [MODERATE]" if total_inv_switches_s > 1000 else "")
+                    )
+                    numa_mig_warning = (
+                        " [HIGH]"
+                        if total_numa_mig_s > 100
+                        else (" [MODERATE]" if total_numa_mig_s > 10 else "")
+                    )
+
+                    print(
+                        f"  CPU Migrations: {self.format_rate(total_migrations_s)} {mig_trend}{mig_warning} | "
+                        f"Involuntary Switches: {self.format_rate(total_inv_switches_s)} {inv_trend}{inv_warning}"
+                    )
+                    print(
+                        f"  NUMA Faults: {self.format_rate(total_numa_faults_s)} {numa_flt_trend} | "
+                        f"NUMA Pages Migrated: {self.format_rate(total_numa_mig_s)} {numa_mig_trend}{numa_mig_warning}"
+                    )
+                    print()
 
                 # Zone Lock / PCP Metrics
                 pcp_stats = self.read_pcp_stats()
@@ -1803,22 +2182,22 @@ class MemoryBandwidthMonitor:
                         )
                     print()
 
-                # Top processes
+                # Top processes (simple mode always uses wide format)
                 if self.merge_by_name:
                     print("TOP PROCESSES (merged by name):")
                     print(
-                        f"  {'#':>4} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>7} {'CPU%':>5} {'NUMA Distribution':<20}"
+                        f"  {'#':>4} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>6} {'Mig/s':>6} {'InvSw':>6} {'CPU%':>5} {'NUMA Dist':<15}"
                     )
                     print(
-                        f"  {'-' * 4} {'-' * 12} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 5} {'-' * 20}"
+                        f"  {'-' * 4} {'-' * 12} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 6} {'-' * 6} {'-' * 6} {'-' * 5} {'-' * 15}"
                     )
                 else:
                     print("TOP PROCESSES:")
                     print(
-                        f"  {'PID':>7} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>7} {'CPU%':>5} {'NUMA Distribution':<20}"
+                        f"  {'PID':>7} {'Name':<12} {'RSS':>7} {'MinF/s':>7} {'Alloc':>7} {'Sys/s':>6} {'Mig/s':>6} {'InvSw':>6} {'CPU%':>5} {'NUMA Dist':<15}"
                     )
                     print(
-                        f"  {'-' * 7} {'-' * 12} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 5} {'-' * 20}"
+                        f"  {'-' * 7} {'-' * 12} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 6} {'-' * 6} {'-' * 6} {'-' * 5} {'-' * 15}"
                     )
 
                 for proc, proc_rates in top_procs[:10]:
@@ -1840,6 +2219,22 @@ class MemoryBandwidthMonitor:
                     else:
                         syscall_str = f"{syscall_rate:.0f}"
 
+                    # Format migrations rate
+                    migrations_rate = proc_rates.get("migrations_s", 0)
+                    if migrations_rate >= 1000:
+                        mig_str = f"{migrations_rate / 1000:.1f}K"
+                    else:
+                        mig_str = f"{migrations_rate:.0f}"
+
+                    # Format involuntary switches rate
+                    inv_rate = proc_rates.get("involuntary_switches_s", 0)
+                    if inv_rate >= 1000000:
+                        inv_str = f"{inv_rate / 1000000:.1f}M"
+                    elif inv_rate >= 1000:
+                        inv_str = f"{inv_rate / 1000:.1f}K"
+                    else:
+                        inv_str = f"{inv_rate:.0f}"
+
                     # NUMA distribution
                     numa_str = proc_rates.get("numa_dist_str", "N/A")
 
@@ -1849,9 +2244,11 @@ class MemoryBandwidthMonitor:
                             f"{self.format_size(proc.rss):>7} "
                             f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
                             f"{alloc_str:>7} "
-                            f"{syscall_str:>7} "
+                            f"{syscall_str:>6} "
+                            f"{mig_str:>6} "
+                            f"{inv_str:>6} "
                             f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
-                            f"{numa_str:<20}"
+                            f"{numa_str[:15]:<15}"
                         )
                     else:
                         print(
@@ -1859,9 +2256,11 @@ class MemoryBandwidthMonitor:
                             f"{self.format_size(proc.rss):>7} "
                             f"{proc_rates.get('minor_faults_s', 0):>7.0f} "
                             f"{alloc_str:>7} "
-                            f"{syscall_str:>7} "
+                            f"{syscall_str:>6} "
+                            f"{mig_str:>6} "
+                            f"{inv_str:>6} "
                             f"{proc_rates.get('cpu_total_pct', 0):>5.1f} "
-                            f"{numa_str:<20}"
+                            f"{numa_str[:15]:<15}"
                         )
 
                 print(f"\n{'=' * 70}")
@@ -1929,15 +2328,32 @@ Zone Lock & PCP Metrics (for diagnosing page allocator contention):
     - 30-50: MODERATE - noticeable contention
     - <30: LOW - minimal contention
 
+Scheduler Metrics (from /proc/[pid]/sched):
+  Scheduler statistics are collected from all processes for accurate system-wide metrics.
+  
+  - CPU Migrations (Mig/s): Times process moved between CPUs per second
+    - >500/s: HIGH (red) - poor CPU affinity, consider pinning
+    - >100/s: MODERATE (yellow)
+  - Involuntary Switches (InvSw): Preemptions per second
+    - >5000/s: HIGH (red) - severe CPU contention
+    - >1000/s: MODERATE (yellow)
+  - NUMA Faults: Memory accesses triggering NUMA balancing
+  - NUMA Pages Migrated: Pages moved between NUMA nodes per second
+    - >100/s: HIGH (red) - significant NUMA migration overhead
+    - >10/s: MODERATE (yellow)
+  - Preferred NUMA Node: Kernel's preferred node for process placement
+
 Per-Process Metrics:
   - RSS: Resident Set Size (physical memory used)
   - MinF/s: Minor page faults per second (new page allocations)
   - Alloc: Estimated memory allocation rate (based on minor faults)
   - Sys/s: Total syscalls per second (read + write syscalls)
+  - Mig/s: CPU migrations per second (scheduler metric)
+  - InvSw: Involuntary context switches per second (scheduler metric)
   - CPU: CPU utilization percentage (user + system time)
-  - NUMA Distribution: Memory distribution across NUMA nodes (e.g., N0:80 N1:20)
-    - Processes with <70 local memory are highlighted in red (poor locality)
-    - Processes with <90 local memory are highlighted in yellow
+  - NUMA Dist: Memory distribution across NUMA nodes (e.g., N0:80%% N1:20%%)
+    - Processes with <70%% local memory are highlighted in red (poor locality)
+    - Processes with <90%% local memory are highlighted in yellow
         """,
     )
 
@@ -2005,7 +2421,9 @@ Per-Process Metrics:
 
     # Start monitoring
     monitor = MemoryBandwidthMonitor(
-        interval=args.interval, top_n=args.top, merge_by_name=args.merge
+        interval=args.interval,
+        top_n=args.top,
+        merge_by_name=args.merge,
     )
 
     monitor.run(use_curses=not args.simple)
