@@ -1692,28 +1692,3 @@ Per-Process Metrics:
 
 if __name__ == "__main__":
     main()
-
-
-# Additional utility function for CSV logging
-def log_to_csv(filename: str, data: dict):
-    """Append monitoring data to CSV file"""
-    import csv
-    from datetime import datetime
-    
-    file_exists = os.path.exists(filename)
-    
-    with open(filename, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=data.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(data)
-
-
-if __name__ == "__main__":
-    # Add CSV logging option
-    import sys
-    if '--csv' in sys.argv:
-        csv_idx = sys.argv.index('--csv')
-        if csv_idx + 1 < len(sys.argv):
-            csv_file = sys.argv[csv_idx + 1]
-            print(f"CSV logging enabled: {csv_file}")
