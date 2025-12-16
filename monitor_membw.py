@@ -262,9 +262,9 @@ class MemoryBandwidthMonitor:
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(data)
-        except IOError:
-            # Don't crash if CSV logging fails, just skip it
-            pass
+        except IOError as error:
+            # Log error to stderr but don't crash the monitoring
+            print(f"Warning: Failed to write to CSV file {self.csv_file}: {error}", file=sys.stderr)
     
     def _prepare_csv_data(self, iteration: int, rates: Dict, node_rates: Dict, zone_lock_metrics: Optional[Dict]) -> dict:
         """Prepare CSV data dictionary from monitoring metrics"""
@@ -285,10 +285,9 @@ class MemoryBandwidthMonitor:
             nr = node_rates.get(node_id, {})
             csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
             csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
-        # Add zone lock metrics if available
-        if zone_lock_metrics:
-            csv_data['lock_contention_pressure'] = zone_lock_metrics.get('lock_contention_pressure', 0)
-            csv_data['zone_lock_acq_per_sec'] = zone_lock_metrics.get('zone_lock_acq_per_sec', 0)
+        # Add zone lock metrics (use 0 as default for consistency)
+        csv_data['lock_contention_pressure'] = zone_lock_metrics.get('lock_contention_pressure', 0) if zone_lock_metrics else 0
+        csv_data['zone_lock_acq_per_sec'] = zone_lock_metrics.get('zone_lock_acq_per_sec', 0) if zone_lock_metrics else 0
         return csv_data
     
     def read_vmstat(self) -> VmStats:
