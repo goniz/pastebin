@@ -262,7 +262,7 @@ class MemoryBandwidthMonitor:
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(data)
-        except IOError as e:
+        except IOError:
             # Don't crash if CSV logging fails, just skip it
             pass
     
@@ -1752,7 +1752,19 @@ Per-Process Metrics:
     )
     
     if args.csv:
-        print(f"CSV logging enabled: {args.csv}\n")
+        # Validate CSV path is writable
+        try:
+            csv_dir = os.path.dirname(args.csv) or '.'
+            if not os.path.exists(csv_dir):
+                print(f"Error: Directory for CSV file does not exist: {csv_dir}")
+                sys.exit(1)
+            if not os.access(csv_dir, os.W_OK):
+                print(f"Error: Cannot write to directory: {csv_dir}")
+                sys.exit(1)
+            print(f"CSV logging enabled: {args.csv}\n")
+        except Exception as e:
+            print(f"Error validating CSV path: {e}")
+            sys.exit(1)
     
     monitor.run(use_curses=not args.simple)
 
