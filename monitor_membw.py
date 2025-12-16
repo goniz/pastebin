@@ -21,7 +21,9 @@ Requirements:
 """
 
 import argparse
+import csv
 import curses
+from datetime import datetime
 import os
 import signal
 import subprocess
@@ -34,7 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import re
 
 # Constants
-PAGE_SIZE = 4096  # bytes
+PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')  # Dynamically get system page size
 CACHE_LINE_SIZE = 64  # bytes for AMD EPYC
 
 @dataclass
@@ -195,10 +197,11 @@ class TrendData:
 class MemoryBandwidthMonitor:
     """Main monitoring class for memory bandwidth and cache statistics"""
     
-    def __init__(self, interval: float = 1.0, top_n: int = 10, merge_by_name: bool = False):
+    def __init__(self, interval: float = 1.0, top_n: int = 10, merge_by_name: bool = False, csv_file: Optional[str] = None):
         self.interval = interval
         self.top_n = top_n
         self.merge_by_name = merge_by_name
+        self.csv_file = csv_file
         self.prev_vmstats: Optional[VmStats] = None
         self.prev_time: float = 0
         self.prev_proc_stats: Dict[int, ProcessMemStats] = {}
@@ -1082,6 +1085,26 @@ class MemoryBandwidthMonitor:
                     zone_lock_metrics, pcp_stats
                 )
                 
+                # Log to CSV if enabled
+                if self.csv_file and rates:
+                    csv_data = {
+                        'timestamp': datetime.now().isoformat(),
+                        'iteration': iteration,
+                        'total_mb_s': rates.get('total_mb_s', 0),
+                        'read_mb_s': rates.get('read_mb_s', 0),
+                        'write_mb_s': rates.get('write_mb_s', 0),
+                        'minor_faults_s': rates.get('minor_faults_s', 0),
+                        'major_faults_s': rates.get('major_faults_s', 0),
+                        'numa_local_pct': rates.get('numa_local_pct', 0),
+                        'memory_pressure': rates.get('memory_pressure', 0),
+                    }
+                    # Add per-node bandwidth
+                    for node_id, nr in node_rates.items():
+                        csv_data[f'node{node_id}_total_mb_s'] = nr.get('total_mb_s', 0)
+                        csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
+                        csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
+                    self._log_to_csv(csv_data)
+                
                 # Update previous stats - key by name for merge mode, by pid otherwise
                 prev_vmstats = current_vmstats
                 prev_numa_stats = current_numa_stats
@@ -1551,6 +1574,26 @@ class MemoryBandwidthMonitor:
                 print(f"\n{'='*70}")
                 print("Legend: ↑ increasing | ↓ decreasing | → stable")
                 
+                # Log to CSV if enabled
+                if self.csv_file and rates:
+                    csv_data = {
+                        'timestamp': datetime.now().isoformat(),
+                        'iteration': iteration,
+                        'total_mb_s': rates.get('total_mb_s', 0),
+                        'read_mb_s': rates.get('read_mb_s', 0),
+                        'write_mb_s': rates.get('write_mb_s', 0),
+                        'minor_faults_s': rates.get('minor_faults_s', 0),
+                        'major_faults_s': rates.get('major_faults_s', 0),
+                        'numa_local_pct': rates.get('numa_local_pct', 0),
+                        'memory_pressure': rates.get('memory_pressure', 0),
+                    }
+                    # Add per-node bandwidth
+                    for node_id, nr in node_rates.items():
+                        csv_data[f'node{node_id}_total_mb_s'] = nr.get('total_mb_s', 0)
+                        csv_data[f'node{node_id}_local_mb_s'] = nr.get('local_mb_s', 0)
+                        csv_data[f'node{node_id}_remote_mb_s'] = nr.get('remote_mb_s', 0)
+                    self._log_to_csv(csv_data)
+                
                 prev_vmstats = current_vmstats
                 prev_numa_stats = current_numa_stats
                 # Key by name for merge mode, by pid otherwise
@@ -1574,6 +1617,23 @@ class MemoryBandwidthMonitor:
                 self.run_simple()
         else:
             self.run_simple()
+    
+    def _log_to_csv(self, data: dict):
+        """Append monitoring data to CSV file"""
+        if not self.csv_file:
+            return
+        
+        file_exists = os.path.exists(self.csv_file)
+        
+        try:
+            with open(self.csv_file, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=data.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(data)
+        except IOError as e:
+            # Silently ignore CSV write errors to not disrupt monitoring
+            pass
 
 
 def signal_handler(signum, frame):
@@ -1648,6 +1708,13 @@ Per-Process Metrics:
         help="Merge processes with the same name (aggregate stats)"
     )
     
+    parser.add_argument(
+        "--csv",
+        type=str,
+        metavar="FILE",
+        help="Log metrics to CSV file (e.g., --csv metrics.csv)"
+    )
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -1684,36 +1751,14 @@ Per-Process Metrics:
     monitor = MemoryBandwidthMonitor(
         interval=args.interval,
         top_n=args.top,
-        merge_by_name=args.merge
+        merge_by_name=args.merge,
+        csv_file=args.csv
     )
+    
+    if args.csv:
+        print(f"CSV logging enabled: {args.csv}\n")
     
     monitor.run(use_curses=not args.simple)
 
-
 if __name__ == "__main__":
     main()
-
-
-# Additional utility function for CSV logging
-def log_to_csv(filename: str, data: dict):
-    """Append monitoring data to CSV file"""
-    import csv
-    from datetime import datetime
-    
-    file_exists = os.path.exists(filename)
-    
-    with open(filename, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=data.keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(data)
-
-
-if __name__ == "__main__":
-    # Add CSV logging option
-    import sys
-    if '--csv' in sys.argv:
-        csv_idx = sys.argv.index('--csv')
-        if csv_idx + 1 < len(sys.argv):
-            csv_file = sys.argv[csv_idx + 1]
-            print(f"CSV logging enabled: {csv_file}")
